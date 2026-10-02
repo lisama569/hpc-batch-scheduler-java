@@ -122,15 +122,29 @@ public final class SchedulerService {
      */
     public SubmissionReport submit(String idempotencyKey, String user, int priority,
                                    int nodeCount, ResourceSet perNode) {
+        return submit(idempotencyKey, user, priority, nodeCount, perNode, List.of());
+    }
+
+    /**
+     * 提交作业（可声明前置依赖）。相同幂等键的并发/重复提交只会产生一个实例：
+     * 内容一致 => 返回既有作业（DUPLICATE，不重复占资源、不重复挂依赖）；
+     * 内容冲突 => 拒绝（IDEMPOTENCY_KEY_CONFLICT），与普通重复可区分。
+     *
+     * 依赖规则：dependsOn 引用的作业必须已存在于系统中，且不得构成直接或间接环，
+     * 违反时在提交时拒绝（DEPENDENCY_NOT_FOUND / DEPENDENCY_CYCLE）。
+     */
+    public SubmissionReport submit(String idempotencyKey, String user, int priority,
+                                   int nodeCount, ResourceSet perNode, List<String> dependsOn) {
         // 非法请求在锁前即可判定。
         validateRequest(idempotencyKey, user, nodeCount, perNode);
+        List<String> deps = normalizeDependsOn(dependsOn);
 
         lock.lock();
         try {
             String existingId = idempotencyIndex.get(idempotencyKey);
             if (existingId != null) {
                 Job existing = jobsById.get(existingId);
-                if (sameContent(existing, user, priority, nodeCount, perNode)) {
+                if (sameContent(existing, user, priority, nodeCount, perNode, deps)) {
                     log.info("submit duplicate idempotencyKey={} jobId={} state={}（不重复占用资源）",
                             idempotencyKey, existing.getJobId(), existing.getState());
                     return report(existing, SubmissionStatus.DUPLICATE, ReasonCode.DUPLICATE_SUBMISSION,
@@ -151,13 +165,25 @@ public final class SchedulerService {
                         "user '" + user + "' has no quota configured");
             }
 
-            String jobId = "job-" + jobSequence.incrementAndGet();
+            String jobId = "job-" + (jobSequence.get() + 1);
+            ReasonCode depError = validateDependencies(jobId, deps);
+            if (depError != ReasonCode.NONE) {
+                log.warn("submit rejected idempotencyKey={} reason={} dependsOn={}",
+                        idempotencyKey, depError, deps);
+                return rejectedReport(null, depError, depError == ReasonCode.DEPENDENCY_CYCLE
+                        ? "dependency cycle detected: dependsOn=" + deps
+                                + " would make job " + jobId + " depend on itself directly or indirectly"
+                        : "dependency not found: dependsOn=" + deps
+                                + " references job(s) that do not exist in the system");
+            }
+            jobSequence.incrementAndGet();
+
             Job job = new Job(jobId, idempotencyKey, user, priority, nodeCount, perNode,
-                    System.currentTimeMillis());
+                    System.currentTimeMillis(), deps);
             jobsById.put(jobId, job);
             idempotencyIndex.put(idempotencyKey, jobId);
-            log.info("submit accepted jobId={} idempotencyKey={} user={} priority={} nodes={} perNode={}",
-                    jobId, idempotencyKey, user, priority, nodeCount, perNode);
+            log.info("submit accepted jobId={} idempotencyKey={} user={} priority={} nodes={} perNode={} dependsOn={}",
+                    jobId, idempotencyKey, user, priority, nodeCount, perNode, deps);
 
             ReasonCode code = scheduleOne(job);
             return report(job, SubmissionStatus.ACCEPTED, code,
@@ -184,11 +210,76 @@ public final class SchedulerService {
         }
     }
 
-    private boolean sameContent(Job existing, String user, int priority, int nodeCount, ResourceSet perNode) {
+    /** 归一化前置依赖列表：去重（保序），空/空白引用视为非法请求。 */
+    private List<String> normalizeDependsOn(List<String> dependsOn) {
+        if (dependsOn == null || dependsOn.isEmpty()) {
+            return List.of();
+        }
+        List<String> deps = new ArrayList<>();
+        for (String dep : dependsOn) {
+            if (dep == null || dep.isBlank()) {
+                throw new ScheduleException(ReasonCode.INVALID_REQUEST,
+                        "dependsOn entries must be non-blank job ids");
+            }
+            if (!deps.contains(dep)) {
+                deps.add(dep);
+            }
+        }
+        return deps;
+    }
+
+    /**
+     * 提交时依赖校验（锁内调用）：
+     * 引用的作业必须已存在（DEPENDENCY_NOT_FOUND）；
+     * 不得构成直接或间接环（DEPENDENCY_CYCLE，含自环）。
+     */
+    private ReasonCode validateDependencies(String newJobId, List<String> deps) {
+        for (String dep : deps) {
+            if (dep.equals(newJobId)) {
+                return ReasonCode.DEPENDENCY_CYCLE;
+            }
+            if (!jobsById.containsKey(dep)) {
+                return ReasonCode.DEPENDENCY_NOT_FOUND;
+            }
+        }
+        Map<String, List<String>> adjacency = new LinkedHashMap<>();
+        for (Job j : jobsById.values()) {
+            adjacency.put(j.getJobId(), j.getDependsOn());
+        }
+        return wouldCreateCycle(adjacency, newJobId, deps)
+                ? ReasonCode.DEPENDENCY_CYCLE : ReasonCode.NONE;
+    }
+
+    /**
+     * 通用成环检测（纯函数，便于直接单测间接环）：在既有依赖图 adjacency 上
+     * 加入 newNode -> newEdges 的边后，若从 newEdges 出发能回到 newNode 则成环。
+     */
+    public static boolean wouldCreateCycle(Map<String, List<String>> adjacency,
+                                           String newNode, List<String> newEdges) {
+        Map<String, List<String>> graph = new LinkedHashMap<>(adjacency);
+        graph.put(newNode, newEdges);
+        // 从 newNode 出发沿依赖边 DFS，能回到 newNode 即环（直接自环或间接环）。
+        List<String> stack = new ArrayList<>(newEdges);
+        java.util.Set<String> visited = new java.util.HashSet<>();
+        while (!stack.isEmpty()) {
+            String cur = stack.remove(stack.size() - 1);
+            if (cur.equals(newNode)) {
+                return true;
+            }
+            if (visited.add(cur)) {
+                stack.addAll(graph.getOrDefault(cur, List.of()));
+            }
+        }
+        return false;
+    }
+
+    private boolean sameContent(Job existing, String user, int priority, int nodeCount,
+                                ResourceSet perNode, List<String> dependsOn) {
         return existing.getUser().equals(user)
                 && existing.getPriority() == priority
                 && existing.getNodeCount() == nodeCount
-                && existing.getPerNodeResource().asMap().equals(perNode.asMap());
+                && existing.getPerNodeResource().asMap().equals(perNode.asMap())
+                && existing.getDependsOn().equals(dependsOn);
     }
 
     // ================= 作业查询与生命周期 =================
@@ -223,6 +314,7 @@ public final class SchedulerService {
             releaseRunningJob(job, JobState.COMPLETED, null);
             log.info("complete jobId={} released={} on {} 个节点", jobId, job.getPerNodeResource(),
                     job.getAssignedNodeIds().size());
+            propagateDependencyOutcome(job);
             runSchedulePass();
             return true;
         } finally {
@@ -236,18 +328,21 @@ public final class SchedulerService {
         try {
             Job job = requireJob(jobId);
             JobState state = job.getState();
-            if (state == JobState.COMPLETED || state == JobState.CANCELLED || state == JobState.PREEMPTED) {
+            if (state == JobState.COMPLETED || state == JobState.CANCELLED
+                    || state == JobState.PREEMPTED || state == JobState.DEPENDENCY_FAILED) {
                 throw new ScheduleException(ReasonCode.JOB_STATE_CONFLICT,
                         "job " + jobId + " already terminal: " + state);
             }
             if (state == JobState.RUNNING) {
                 releaseRunningJob(job, JobState.CANCELLED, null);
                 log.info("cancel running jobId={} 已释放全部资源", jobId);
+                propagateDependencyOutcome(job);
                 runSchedulePass();
             } else {
                 job.setState(JobState.CANCELLED);
-                job.setLastReason("cancelled by user while queued");
-                log.info("cancel queued jobId={}", jobId);
+                job.setLastReason("cancelled by user while " + state.name().toLowerCase());
+                log.info("cancel {} jobId={}", state.name().toLowerCase(), jobId);
+                propagateDependencyOutcome(job);
             }
             return true;
         } finally {
@@ -317,7 +412,84 @@ public final class SchedulerService {
     }
 
     private ReasonCode scheduleOne(Job job) {
+        ReasonCode dep = evaluateDependencies(job);
+        if (dep != ReasonCode.NONE) {
+            return dep;
+        }
         return tryStart(job);
+    }
+
+    /**
+     * 依赖评估（锁内调用）：等待前置的作业不占资源、不预留、不计配额、不参与调度扫描。
+     * - 任一前置已处于失败终态（CANCELLED/PREEMPTED/DEPENDENCY_FAILED）
+     *   => 本作业落入 DEPENDENCY_FAILED 终态，并沿依赖链向下传递；
+     * - 否则仍有前置未成功完成 => 进入/保持 WAITING，原因中列出仍在等待的作业；
+     * - 全部前置 COMPLETED => 返回 NONE（WAITING 中的作业被解锁为 QUEUED，等待本轮调度）。
+     */
+    private ReasonCode evaluateDependencies(Job job) {
+        if (job.getDependsOn().isEmpty()) {
+            return ReasonCode.NONE;
+        }
+        List<String> pending = new ArrayList<>();
+        for (String depId : job.getDependsOn()) {
+            Job dep = jobsById.get(depId);
+            if (dep == null) {
+                continue; // 提交时已校验存在；防御性跳过
+            }
+            JobState s = dep.getState();
+            if (s == JobState.CANCELLED || s == JobState.PREEMPTED || s == JobState.DEPENDENCY_FAILED) {
+                failDependent(job, dep);
+                return ReasonCode.DEPENDENCY_FAILED;
+            }
+            if (s != JobState.COMPLETED) {
+                pending.add(depId);
+            }
+        }
+        if (!pending.isEmpty()) {
+            job.setState(JobState.WAITING);
+            job.setLastReason("[WAITING_ON_DEPENDENCIES] waiting on predecessor jobs: " + pending);
+            log.info("stay-waiting jobId={} waitingOn={}（不占资源/不计配额/不参与调度）",
+                    job.getJobId(), pending);
+            return ReasonCode.WAITING_ON_DEPENDENCIES;
+        }
+        if (job.getState() == JobState.WAITING) {
+            job.setState(JobState.QUEUED);
+            job.setLastReason(null);
+            log.info("dependency-unlocked jobId={} 全部前置已成功完成，进入调度队列", job.getJobId());
+        }
+        return ReasonCode.NONE;
+    }
+
+    /** 前置失败终态沿依赖链向下传递：后继落入 DEPENDENCY_FAILED 并继续级联。 */
+    private void failDependent(Job dependent, Job failedCause) {
+        dependent.setState(JobState.DEPENDENCY_FAILED);
+        dependent.setLastReason("[DEPENDENCY_FAILED] predecessor " + failedCause.getJobId()
+                + " finished as " + failedCause.getState()
+                + " (not COMPLETED); dependent can never be scheduled");
+        log.info("dependency-failed jobId={} cause={} causeState={}",
+                dependent.getJobId(), failedCause.getJobId(), failedCause.getState());
+        propagateDependencyOutcome(dependent);
+    }
+
+    /**
+     * 前置作业到达终态后，自动重新评估所有等待它的后继（锁内调用）：
+     * 成功 => 解锁重新评估；失败 => 后继落入 DEPENDENCY_FAILED 并级联。
+     */
+    private void propagateDependencyOutcome(Job finished) {
+        boolean succeeded = finished.getState() == JobState.COMPLETED;
+        for (Job dependent : jobsById.values()) {
+            if (dependent.getState() != JobState.WAITING) {
+                continue;
+            }
+            if (!dependent.getDependsOn().contains(finished.getJobId())) {
+                continue;
+            }
+            if (succeeded) {
+                evaluateDependencies(dependent);
+            } else {
+                failDependent(dependent, finished);
+            }
+        }
     }
 
     /**
@@ -363,6 +535,7 @@ public final class SchedulerService {
                     + " < requester priority " + record.requesterPriority() + "): " + record.basis());
             log.info("preempt victim={} by={} nodesReleased={} basis={}",
                     victim.getJobId(), job.getJobId(), record.nodesReleased(), record.basis());
+            propagateDependencyOutcome(victim);
         }
         boolean allocated = ledger.allocateGang(plan.selectedNodeIds(), job.getJobId(), job.getPerNodeResource());
         if (!allocated) {

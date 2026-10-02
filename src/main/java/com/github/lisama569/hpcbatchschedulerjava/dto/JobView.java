@@ -14,5 +14,6 @@ public record JobView(String jobId,
                       String state,
                       List<String> assignedNodeIds,
                       String lastReason,
-                      String preemptedByJobId) {
+                      String preemptedByJobId,
+                      List<String> dependsOn) {
 }

@@ -32,5 +32,13 @@ public enum ReasonCode {
     /** 作业当前状态不允许该操作。 */
     JOB_STATE_CONFLICT,
     /** 节点不存在。 */
-    NODE_NOT_FOUND
+    NODE_NOT_FOUND,
+    /** 等待前置：声明的前置作业尚未全部成功完成（不占用/不预留资源，不计配额）。 */
+    WAITING_ON_DEPENDENCIES,
+    /** 非法请求：前置依赖引用了不存在的作业。 */
+    DEPENDENCY_NOT_FOUND,
+    /** 非法请求：前置依赖构成直接或间接环。 */
+    DEPENDENCY_CYCLE,
+    /** 终态原因：前置作业未成功结束（取消/抢占/前置失败沿依赖链传递）。 */
+    DEPENDENCY_FAILED
 }

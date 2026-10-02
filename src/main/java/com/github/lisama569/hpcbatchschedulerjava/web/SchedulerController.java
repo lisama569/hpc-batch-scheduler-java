@@ -54,7 +54,8 @@ public class SchedulerController {
         int nodeCount = request.nodeCount() == null ? 1 : request.nodeCount();
 
         SubmissionReport report = scheduler.submit(
-                request.idempotencyKey(), request.user(), priority, nodeCount, perNode);
+                request.idempotencyKey(), request.user(), priority, nodeCount, perNode,
+                request.dependsOn() == null ? List.of() : request.dependsOn());
 
         HttpStatus httpStatus = switch (report.status()) {
             case ACCEPTED -> HttpStatus.CREATED;
@@ -171,7 +172,8 @@ public class SchedulerController {
                 job.getState().name(),
                 job.getAssignedNodeIds(),
                 job.getLastReason(),
-                job.getPreemptedByJobId());
+                job.getPreemptedByJobId(),
+                job.getDependsOn());
     }
 
     static NodeView toNodeView(ClusterNode node) {

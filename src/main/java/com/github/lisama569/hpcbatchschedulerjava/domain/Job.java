@@ -12,6 +12,8 @@ public final class Job {
     private final int nodeCount;
     private final ResourceSet perNodeResource;
     private final long submittedAtMillis;
+    /** 前置作业 id 列表：全部成功完成（COMPLETED）后才允许被调度。 */
+    private final List<String> dependsOn;
 
     private volatile JobState state;
     private volatile List<String> assignedNodeIds = List.of();
@@ -20,6 +22,13 @@ public final class Job {
 
     public Job(String jobId, String idempotencyKey, String user, int priority,
                int nodeCount, ResourceSet perNodeResource, long submittedAtMillis) {
+        this(jobId, idempotencyKey, user, priority, nodeCount, perNodeResource,
+                submittedAtMillis, List.of());
+    }
+
+    public Job(String jobId, String idempotencyKey, String user, int priority,
+               int nodeCount, ResourceSet perNodeResource, long submittedAtMillis,
+               List<String> dependsOn) {
         this.jobId = jobId;
         this.idempotencyKey = idempotencyKey;
         this.user = user;
@@ -27,6 +36,7 @@ public final class Job {
         this.nodeCount = nodeCount;
         this.perNodeResource = perNodeResource;
         this.submittedAtMillis = submittedAtMillis;
+        this.dependsOn = List.copyOf(dependsOn);
         this.state = JobState.QUEUED;
     }
 
@@ -56,6 +66,10 @@ public final class Job {
 
     public long getSubmittedAtMillis() {
         return submittedAtMillis;
+    }
+
+    public List<String> getDependsOn() {
+        return dependsOn;
     }
 
     public JobState getState() {

@@ -20,7 +20,7 @@ dto/         请求/响应视图
 ## 2. 作业模型与提交幂等
 
 - 作业请求包含：`idempotencyKey`、`user`、`priority`（越大越高）、`nodeCount`、
-  每节点资源 `cpu / memoryMb / gpu`。
+  每节点资源 `cpu / memoryMb / gpu`，以及可选的 `dependsOn`（前置作业 id 列表，见第 7 节）。
 - **幂等提交**：相同幂等键只产生一个作业实例。
   - 键相同且请求内容一致：返回 `status=DUPLICATE, reasonCode=DUPLICATE_SUBMISSION`，
     复用既有作业，**不会**第二次占用资源（HTTP `200`）。
@@ -75,7 +75,36 @@ QUOTA_MEMORY_LIMIT`，消息中带具体上限数值，作为可解释依据；�
    作业排队，原因为 `PREEMPTION_INSUFFICIENT` / `NO_FITTING_NODE` / `INSUFFICIENT_CAPACITY`。
 6. 被抢占作业进入终态 `PREEMPTED`，记录 `preemptedByJobId` 与文字依据（双方优先级、释放节点）。
 
-## 7. 可解释的失败原因（ReasonCode）
+## 7. 作业依赖（dependsOn）
+
+提交作业时可通过 `dependsOn: ["job-1", ...]` 声明前置作业（可多个），把一批本来要按
+顺序跑的作业串起来，由系统自己管先后：
+
+- **等待期（`WAITING`）**：前置未全部 `COMPLETED` 前，后继处于独立的 `WAITING` 状态——
+  不占用也不预留节点资源、不计入用户配额（配额只统计 `RUNNING`）、不参与调度扫描，
+  因此绝不会被误报成容量不足；`lastReason` 为
+  `[WAITING_ON_DEPENDENCIES] waiting on predecessor jobs: [...]`，能一眼看出在等哪几个作业。
+- **提交时校验**（拒绝不产生任何作业实例，两种原因可区分）：
+  - 引用不存在的作业 => `DEPENDENCY_NOT_FOUND`；
+  - 直接或间接成环（含自环）=> `DEPENDENCY_CYCLE`。
+    通用成环检测见 `SchedulerService.wouldCreateCycle`（纯函数，可单独单测）。
+- **成功自动解锁**：前置 `COMPLETED` 时，等待它的后继在同一把锁内被自动重新评估，
+  全部前置成功后转为 `QUEUED` 并紧接着进入当轮调度扫描——能跑就直接跑起来，
+  无需手动 `tick`。一批后继同时解锁时，启动顺序沿用全局规则
+  「优先级降序、同优先级先到先得」，稳定且可解释。
+- **失败结局沿链传递**：前置被 `CANCELLED` / `PREEMPTED`（或自身 `DEPENDENCY_FAILED`）时，
+  后继落入可区分终态 `DEPENDENCY_FAILED`，`lastReason` 指明是哪个前置、以什么结局结束；
+  该结局沿依赖链级联（A 取消 => B 失败 => 等 B 的 C 也失败），不会无声悬挂。
+- **与既有能力的兼容范围**：
+  - 幂等：`dependsOn` 属于幂等内容——同键同依赖重复提交仍只一个实例、不多挂依赖；
+    同键不同依赖按 `IDEMPOTENCY_KEY_CONFLICT` 拒绝。
+  - 配额/成组/抢占/节点维护：`WAITING` 不进入任何资源与配额账本，解锁后走与
+    普通作业完全相同的配额→成组放置→抢占判定；前置完成、容量释放、并发提交
+    同时发生时，所有状态迁移仍在同一把公平锁内串行完成，账本不超分、不部分分配。
+  - HTTP 与进程内入口共享同一 `SchedulerService`，依赖结论（等待/解锁/失败传递/拒绝）
+    在两种入口下完全一致。
+
+## 8. 可解释的失败原因（ReasonCode）
 
 | 原因码 | 含义 | HTTP 状态（示例） |
 | --- | --- | --- |
@@ -87,12 +116,16 @@ QUOTA_MEMORY_LIMIT`，消息中带具体上限数值，作为可解释依据；�
 | `NO_FITTING_NODE` | 单机容量硬上限不满足 | 422 |
 | `INSUFFICIENT_CAPACITY` | 临时空闲资源不足（排队） | 422 |
 | `PREEMPTION_INSUFFICIENT` | 抢占更低优先级作业后仍不足 | 422 |
+| `WAITING_ON_DEPENDENCIES` | 等待前置作业完成（不占资源/不计配额） | 提交返回 201，作业状态 `WAITING` |
+| `DEPENDENCY_NOT_FOUND` | 前置依赖引用了不存在的作业 | 400（异常）/ 422（提交报告拒绝） |
+| `DEPENDENCY_CYCLE` | 前置依赖直接或间接成环 | 400（异常）/ 422（提交报告拒绝） |
+| `DEPENDENCY_FAILED` | 前置未成功结束（取消/抢占/级联失败） | 终态，非错误响应 |
 | `JOB_NOT_FOUND / NODE_NOT_FOUND / JOB_STATE_CONFLICT` | 资源不存在/状态冲突 | 404/409 |
 
 错误响应体统一为 `{"reasonCode": "...", "message": "..."}`；排队作业的 `lastReason`
 字段也保留 `[原因码] 判定依据`，便于追溯。
 
-## 8. HTTP 接口
+## 9. HTTP 接口
 
 | 方法 & 路径 | 说明 |
 | --- | --- |
@@ -100,10 +133,10 @@ QUOTA_MEMORY_LIMIT`，消息中带具体上限数值，作为可解释依据；�
 | `GET  /api/nodes` | 查看节点容量、占用、状态与运行作业 |
 | `POST /api/nodes/{id}/state` | `{state: HEALTHY/DRAINING/UNAVAILABLE}` |
 | `POST /api/quotas` | 设置用户配额 |
-| `POST /api/jobs` | 幂等提交作业 |
-| `GET  /api/jobs` / `GET /api/jobs/{id}` | 查询作业（含 lastReason） |
-| `POST /api/jobs/{id}/complete` | 完成作业并释放资源 |
-| `POST /api/jobs/{id}/cancel` | 取消排队/运行作业 |
+| `POST /api/jobs` | 幂等提交作业（可选 `dependsOn: ["job-1",...]` 声明前置） |
+| `GET  /api/jobs` / `GET /api/jobs/{id}` | 查询作业（含 lastReason、dependsOn） |
+| `POST /api/jobs/{id}/complete` | 完成作业并释放资源（自动解锁后继） |
+| `POST /api/jobs/{id}/cancel` | 取消排队/等待/运行作业（失败结局沿依赖链传递） |
 | `POST /api/scheduler/tick` | 显式触发一次调度扫描 |
 
 启动时默认注入演示集群（3 节点 + alice/bob 配额），可用
@@ -113,18 +146,26 @@ QUOTA_MEMORY_LIMIT`，消息中带具体上限数值，作为可解释依据；�
 
 ```bash
 mvn spring-boot:run
+# 提交前置作业（立即运行）
 curl -s -X POST localhost:8080/api/jobs -H 'Content-Type: application/json' \
   -d '{"idempotencyKey":"k1","user":"alice","priority":5,"nodeCount":2,
        "cpu":4,"memoryMb":8000,"gpu":1}'
+# 提交后继：等待 k1 对应作业完成，返回 state=WAITING
+curl -s -X POST localhost:8080/api/jobs -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"k2","user":"alice","priority":5,"nodeCount":1,
+       "cpu":2,"memoryMb":4000,"gpu":0,"dependsOn":["job-1"]}'
+# 完成前置后，后继自动解锁启动，无需手动 tick
+curl -s -X POST localhost:8080/api/jobs/job-1/complete
+curl -s localhost:8080/api/jobs/job-2   # state=RUNNING
 ```
 
-## 9. 测试与验证方法
+## 10. 测试与验证方法
 
 ```bash
 mvn test
 ```
 
-覆盖场景（共 18 个用例，全部断言 + 日志打印「输入」与「判定依据」）：
+覆盖场景（共 27 个用例，全部断言 + 日志打印「输入」与「判定依据」）：
 
 - `IdempotencyTest`：重复提交复用实例不重复占资源、同键内容冲突、非法请求、未知用户；
 - `ConcurrentSubmitTest`：32 线程并发同键提交只有 1 个 `ACCEPTED`；
@@ -134,9 +175,15 @@ mvn test
 - `NodeDrainTest`：排空中节点不接新作业且不驱逐既有作业、不可用节点被排除、恢复后排队作业启动；
 - `PreemptionQuotaTest`：严格优先级抢占与完整回收、同优先级不被抢占、抢占无意义时不误杀、
   三类配额超额原因；
+- `DependencySchedulingTest`：等待前置不占资源/不计配额且原因列出所等作业、
+  前置成功后无手动 tick 自动解锁、取消沿依赖链级联为 `DEPENDENCY_FAILED`、
+  抢占前置导致后继失败、成环（自环/间接环）与引用不存在以不同原因码拒绝、
+  批量解锁顺序确定（优先级降序+先到先得）且恰好占满不超分、
+  16 线程并发提交后继并解锁时账本守恒、同键重复提交不多挂依赖；
 - `ResourceConservationTest`：填充→跨节点成组抢占→完成→排空/恢复的混合生命周期下，
   从运行作业视角汇总的 CPU/MEM/GPU 与节点账本逐类相等，最终归零，验证无泄漏、无超分；
-- `WebApiTest`：HTTP 入口与进程内入口共享同一核心 Bean，幂等/非法/排队/恢复结论一致。
+- `WebApiTest`：HTTP 入口与进程内入口共享同一核心 Bean，幂等/非法/排队/恢复结论一致；
+  依赖场景下 HTTP 提交等待、进程内完成前置后 HTTP 侧可见自动解锁，拒绝原因码一致。
 
 调度器在每次启动、排队、抢占、回收和调度轮次结束时都会打印结构化日志
 （含优先级、所选节点、逐节点缺额、抢占依据、全局已用资源与 `账本一致=true/false`），

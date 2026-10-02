@@ -110,6 +110,60 @@ class WebApiTest {
         assertEquals("RUNNING", gotJson.get("state").asText());
     }
 
+    @Test
+    void httpDependencySemanticsMatchInProcessEntry() throws Exception {
+        postJson("/api/nodes", """
+                {"nodeId":"dep-n1","cpu":8,"memoryMb":16000,"gpu":0}""");
+        postJson("/api/quotas", """
+                {"user":"carol","maxRunningJobs":10,"maxCpu":100,"maxMemoryMb":100000}""");
+
+        // HTTP 提交前置作业并立即运行
+        MvcResult pre = mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"idempotencyKey":"http-pre","user":"carol","priority":5,"nodeCount":1,
+                                 "cpu":2,"memoryMb":100,"gpu":0}"""))
+                .andExpect(status().isCreated()).andReturn();
+        String preId = json.readTree(pre.getResponse().getContentAsString()).get("jobId").asText();
+
+        // HTTP 提交带依赖的后继：必须 WAITING 且原因中列出前置 id
+        MvcResult dep = mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"idempotencyKey":"http-dep","user":"carol","priority":5,"nodeCount":1,
+                                 "cpu":2,"memoryMb":100,"gpu":0,"dependsOn":["%s"]}"""
+                                .formatted(preId)))
+                .andExpect(status().isCreated()).andReturn();
+        JsonNode depJson = json.readTree(dep.getResponse().getContentAsString());
+        log.info("[HTTP 判定] 带依赖提交 => state={} reason={}",
+                depJson.get("jobState").asText(), depJson.get("reasonCode").asText());
+        assertEquals("WAITING", depJson.get("jobState").asText());
+        assertEquals("WAITING_ON_DEPENDENCIES", depJson.get("reasonCode").asText());
+        String depId = depJson.get("jobId").asText();
+
+        // HTTP 提交引用不存在作业 => 422 + DEPENDENCY_NOT_FOUND（与进程内结论一致）
+        MvcResult bad = mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"idempotencyKey":"http-bad","user":"carol","priority":5,"nodeCount":1,
+                                 "cpu":2,"memoryMb":100,"gpu":0,"dependsOn":["job-999"]}"""))
+                .andExpect(status().isUnprocessableEntity()).andReturn();
+        JsonNode badJson = json.readTree(bad.getResponse().getContentAsString());
+        log.info("[HTTP 判定] 引用不存在作业 => reason={} msg={}",
+                badJson.get("reasonCode").asText(), badJson.get("message").asText());
+        assertEquals("DEPENDENCY_NOT_FOUND", badJson.get("reasonCode").asText());
+
+        // 进程内入口完成前置：HTTP 侧必须看到后继被自动解锁并启动
+        scheduler.completeJob(preId);
+        MvcResult got = mockMvc.perform(get("/api/jobs/" + depId))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode gotJson = json.readTree(got.getResponse().getContentAsString());
+        log.info("[HTTP 判定] 进程内完成前置后 HTTP 查询后继 => state={} dependsOn={}",
+                gotJson.get("state").asText(), gotJson.get("dependsOn"));
+        assertEquals("RUNNING", gotJson.get("state").asText());
+        assertEquals(preId, gotJson.get("dependsOn").get(0).asText());
+    }
+
     private void postJson(String path, String body) throws Exception {
         mockMvc.perform(post(path).contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().is2xxSuccessful());

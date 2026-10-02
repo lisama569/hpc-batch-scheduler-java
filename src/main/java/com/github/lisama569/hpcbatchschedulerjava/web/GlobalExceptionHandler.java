@@ -35,12 +35,14 @@ public class GlobalExceptionHandler {
 
     private HttpStatus httpStatus(ReasonCode code) {
         return switch (code) {
-            case INVALID_REQUEST, IDEMPOTENCY_KEY_CONFLICT -> HttpStatus.BAD_REQUEST;
+            case INVALID_REQUEST, IDEMPOTENCY_KEY_CONFLICT,
+                 DEPENDENCY_NOT_FOUND, DEPENDENCY_CYCLE -> HttpStatus.BAD_REQUEST;
             case JOB_NOT_FOUND, NODE_NOT_FOUND, UNKNOWN_USER -> HttpStatus.NOT_FOUND;
             case JOB_STATE_CONFLICT, DUPLICATE_SUBMISSION -> HttpStatus.CONFLICT;
             case QUOTA_JOB_LIMIT, QUOTA_CPU_LIMIT, QUOTA_MEMORY_LIMIT,
                  INSUFFICIENT_NODES, NO_FITTING_NODE, INSUFFICIENT_CAPACITY,
-                 PREEMPTION_INSUFFICIENT -> HttpStatus.UNPROCESSABLE_ENTITY;
+                 PREEMPTION_INSUFFICIENT, WAITING_ON_DEPENDENCIES,
+                 DEPENDENCY_FAILED -> HttpStatus.UNPROCESSABLE_ENTITY;
             case NONE -> HttpStatus.OK;
         };
     }

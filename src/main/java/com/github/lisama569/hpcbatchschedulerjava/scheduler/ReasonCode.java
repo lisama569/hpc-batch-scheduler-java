@@ -27,6 +27,14 @@ public enum ReasonCode {
     INSUFFICIENT_CAPACITY,
     /** 抢占后仍无法满足成组需求。 */
     PREEMPTION_INSUFFICIENT,
+    /** 等待前置作业：声明的依赖尚未全部成功完成（不占用资源、不计配额）。 */
+    WAITING_ON_DEPENDENCIES,
+    /** 非法依赖：引用了不存在的作业。 */
+    DEPENDENCY_NOT_FOUND,
+    /** 非法依赖：直接或间接成环（含自引用）。 */
+    DEPENDENCY_CYCLE,
+    /** 终态原因：前置作业未成功结束（取消/抢占/前置失败级联）。 */
+    DEPENDENCY_FAILED,
     /** 作业不存在。 */
     JOB_NOT_FOUND,
     /** 作业当前状态不允许该操作。 */

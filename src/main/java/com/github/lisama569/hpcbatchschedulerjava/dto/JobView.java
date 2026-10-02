@@ -13,6 +13,7 @@ public record JobView(String jobId,
                       long gpu,
                       String state,
                       List<String> assignedNodeIds,
+                      List<String> dependsOnJobIds,
                       String lastReason,
                       String preemptedByJobId) {
 }

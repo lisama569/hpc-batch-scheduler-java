@@ -110,6 +110,70 @@ class WebApiTest {
         assertEquals("RUNNING", gotJson.get("state").asText());
     }
 
+    @Test
+    void httpDependencyWaitsAutoUnlocksAndRejectsBadReferences() throws Exception {
+        postJson("/api/nodes", """
+                {"nodeId":"dep-n1","cpu":8,"memoryMb":8000,"gpu":0}""");
+        postJson("/api/quotas", """
+                {"user":"carol","maxRunningJobs":10,"maxCpu":100,"maxMemoryMb":100000}""");
+        log.info("[HTTP 输入] 注册 dep-n1 8CPU，配置 carol 配额");
+
+        // 前置 A 通过 HTTP 提交并运行
+        MvcResult aRes = mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"idempotencyKey":"dep-a","user":"carol","priority":5,"nodeCount":1,
+                                 "cpu":4,"memoryMb":1000,"gpu":0}"""))
+                .andExpect(status().isCreated()).andReturn();
+        String aId = json.readTree(aRes.getResponse().getContentAsString()).get("jobId").asText();
+        log.info("[HTTP 判定] 前置 A => jobId={}", aId);
+
+        // 后继 B 依赖 A：必须 WAITING，原因里能看到在等谁
+        MvcResult bRes = mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"idempotencyKey":"dep-b","user":"carol","priority":5,"nodeCount":1,
+                                 "cpu":4,"memoryMb":1000,"gpu":0,"dependsOn":["dep-a"]}"""))
+                .andExpect(status().isCreated()).andReturn();
+        JsonNode bJson = json.readTree(bRes.getResponse().getContentAsString());
+        String bId = bJson.get("jobId").asText();
+        log.info("[HTTP 判定] B 依赖 A（按幂等键引用）=> state={} reason={} msg={}",
+                bJson.get("jobState").asText(), bJson.get("reasonCode").asText(),
+                bJson.get("message").asText());
+        assertEquals("WAITING", bJson.get("jobState").asText());
+        assertEquals("WAITING_ON_DEPENDENCIES", bJson.get("reasonCode").asText());
+
+        // 引用不存在的作业：HTTP 与进程内结论一致（REJECTED + DEPENDENCY_NOT_FOUND => 422）
+        MvcResult bad = mockMvc.perform(post("/api/jobs")
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"idempotencyKey":"dep-bad","user":"carol","priority":5,"nodeCount":1,
+                                 "cpu":1,"memoryMb":100,"gpu":0,"dependsOn":["job-ghost"]}"""))
+                .andExpect(status().isUnprocessableEntity()).andReturn();
+        JsonNode badJson = json.readTree(bad.getResponse().getContentAsString());
+        log.info("[HTTP 判定] 依赖不存在 => 422 reason={}", badJson.get("reasonCode").asText());
+        assertEquals("DEPENDENCY_NOT_FOUND", badJson.get("reasonCode").asText());
+
+        // 通过 HTTP 完成 A：B 必须被自动解锁并直接运行（无需手动 tick）
+        postJson("/api/jobs/" + aId + "/complete", "{}");
+        MvcResult got = mockMvc.perform(get("/api/jobs/" + bId))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode gotJson = json.readTree(got.getResponse().getContentAsString());
+        log.info("[HTTP 判定] A 完成后 B => state={} dependsOn={}",
+                gotJson.get("state").asText(), gotJson.get("dependsOnJobIds").toString());
+        assertEquals("RUNNING", gotJson.get("state").asText());
+        assertEquals(aId, gotJson.get("dependsOnJobIds").get(0).asText());
+
+        // 通过 HTTP 取消运行中的 B：等 B 的 C（进程内提交）必须落 DEPENDENCY_FAILED，两入口结论一致
+        scheduler.submit("dep-c", "carol", 5, 1,
+                com.github.lisama569.hpcbatchschedulerjava.domain.ResourceSet.of(1, 100, 0),
+                java.util.List.of(bId));
+        postJson("/api/jobs/" + bId + "/cancel", "{}");
+        var cJob = scheduler.listJobs().stream()
+                .filter(j -> j.getIdempotencyKey().equals("dep-c")).findFirst().orElseThrow();
+        log.info("[HTTP 判定] HTTP 取消 B 后，进程内提交的 C => state={} reason={}",
+                cJob.getState(), cJob.getLastReason());
+        assertEquals(com.github.lisama569.hpcbatchschedulerjava.domain.JobState.DEPENDENCY_FAILED,
+                cJob.getState());
+    }
+
     private void postJson(String path, String body) throws Exception {
         mockMvc.perform(post(path).contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().is2xxSuccessful());

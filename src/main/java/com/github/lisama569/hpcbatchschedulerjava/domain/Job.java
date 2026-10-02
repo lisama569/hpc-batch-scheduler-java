@@ -15,6 +15,7 @@ public final class Job {
 
     private volatile JobState state;
     private volatile List<String> assignedNodeIds = List.of();
+    private volatile List<String> dependsOnJobIds = List.of();
     private volatile String lastReason;
     private volatile String preemptedByJobId;
 
@@ -72,6 +73,15 @@ public final class Job {
 
     public void setAssignedNodeIds(List<String> assignedNodeIds) {
         this.assignedNodeIds = assignedNodeIds;
+    }
+
+    /** 前置作业 id 列表（提交时声明，已解析为 jobId，不可变）。 */
+    public List<String> getDependsOnJobIds() {
+        return dependsOnJobIds;
+    }
+
+    public void setDependsOnJobIds(List<String> dependsOnJobIds) {
+        this.dependsOnJobIds = dependsOnJobIds;
     }
 
     public String getLastReason() {

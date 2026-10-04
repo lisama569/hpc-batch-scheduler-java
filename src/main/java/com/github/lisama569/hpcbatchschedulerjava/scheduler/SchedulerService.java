@@ -657,9 +657,13 @@ public final class SchedulerService {
                 "found " + chosen.size() + " healthy nodes each satisfying " + need);
     }
 
+    /**
+     * best-fit：剩余量相对需求的富余分越小越贴合，优先选用；
+     * 同分按节点 id 字典序，保证同一批作业重复调度结论一致。
+     */
     private Comparator<ClusterNode> bestFitComparator(ResourceSet need) {
         return Comparator
-                .comparingLong((ClusterNode n) -> -slackScore(n.available(), need))
+                .comparingLong((ClusterNode n) -> slackScore(n.available(), need))
                 .thenComparing(ClusterNode::getNodeId);
     }
 
@@ -784,7 +788,8 @@ public final class SchedulerService {
                 ready.add(e.getKey());
             }
         }
-        ready.sort(Comparator.comparingLong((String id) -> -slackScore(simulatedAvailable.get(id), need))
+        // 与普通放置同一套 best-fit 规则：富余分小者优先，同分按节点 id，保证结论可复现。
+        ready.sort(Comparator.comparingLong((String id) -> slackScore(simulatedAvailable.get(id), need))
                 .thenComparing(id -> id));
         return ready;
     }

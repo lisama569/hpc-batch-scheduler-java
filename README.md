@@ -35,14 +35,25 @@ dto/         请求/响应视图
 - 放置判定顺序：
   1. **配额**（见下节）；
   2. 健康可调度节点中，单机**容量上限** `capacity` 必须能容纳每节点需求
-     （`NO_FITTING_NODE` 是硬上限，排空恢复/抢占都改变不了，故提前给出明确原因）；
-  3. 当前空闲资源能一次性凑齐 `nodeCount` 个节点 => 立即成组启动；
-  4. 否则给出 `INSUFFICIENT_CAPACITY`，响应/日志包含**逐节点缺额**（每类资源还差多少）。
-- 节点选择采用 best-fit：富余资源最贴近需求的节点优先，为更大需求保留充裕节点。
+     （`NO_FITTING_NODE` 是硬上限，排空恢复/抢占都改变不了，故提前给出明确原因）。
+     注意判定用的是**每节点需求对单机容量**，不是作业总需求：成组作业总量超过单机
+     容量是正常的，只要每台节点各自装得下每节点需求即可调度；
+  3. 当前**真实剩余量**（`capacity - used`，即扣除已在该节点运行的其他作业）能一次性
+     凑齐 `nodeCount` 个节点 => 立即成组启动；只要集群里还有装得下的节点就会落下去，
+     不会无故排队；
+  4. 否则给出 `INSUFFICIENT_CAPACITY`，响应/日志包含**逐节点缺额**（每类资源还差多少），
+     资源释放后的下一轮扫描会自动启动，不会“永远排不上”。
+- **落点选择（best-fit）**：在剩余量满足需求的节点中，选「富余分」最小、即剩余资源
+  最贴近需求的节点——小作业落到刚好装得下的节点上，把宽裕的大节点留给后面更大的
+  作业，避免小作业挤占大节点导致大作业无处可跑。富余分 = 各需求资源类
+  `剩余量 - 需求量` 之和；同分按节点 id 字典序，因此同一批作业重复调度结论完全一致，
+  可复现、可解释（日志会打印所选节点与判定依据）。
 - 成组分配是**原子操作**：先校验全部节点，再统一落账；任一节点失败则整体回滚，
   不存在部分分配。资源释放同样按全部分配节点完整回收。
 - 触发时机：新提交、作业完成/取消、节点恢复、以及显式 `POST /api/scheduler/tick`；
-  一轮内按「优先级降序、同优先级先到先得」扫描排队队列。
+  一轮内按「优先级降序、同优先级先到先得」扫描排队队列。所有判定在同一把公平锁内
+  串行完成，并发提交、提交与完成交错时每台节点占用都不会超过容量，账本与运行作业
+  视角始终对得上。
 
 ## 4. 节点健康与排空
 
@@ -74,6 +85,15 @@ QUOTA_MEMORY_LIMIT`，消息中带具体上限数值，作为可解释依据；�
 5. 抢占后仍无法满足（或单机容量硬上限不满足/无更低优先级作业）=> 不动任何运行作业，
    作业排队，原因为 `PREEMPTION_INSUFFICIENT` / `NO_FITTING_NODE` / `INSUFFICIENT_CAPACITY`。
 6. 被抢占作业进入终态 `PREEMPTED`，记录 `preemptedByJobId` 与文字依据（双方优先级、释放节点）。
+
+**落点选择与抢占/排空恢复的配合**：
+
+- 抢占规划模拟出的候选节点，与普通放置使用**同一套 best-fit 规则**（富余分小者优先、
+  同分按节点 id），因此“直接放得下”与“抢占后放得下”的落点口径一致、结论可复现；
+- 被抢占作业的资源先在账本上**完整回收**，再按 best-fit 选出的节点原子成组分配，
+  不会出现重复占用；
+- 节点排空（`DRAINING`/`UNAVAILABLE`）期间不参与落点；恢复 `HEALTHY` 后的下一轮扫描
+  按当时的真实剩余量重新做 best-fit 选择，排队作业自动启动，无需人工干预。
 
 ## 7. 作业依赖（dependsOn）
 
@@ -159,19 +179,40 @@ curl -s -X POST localhost:8080/api/jobs/job-1/complete
 curl -s localhost:8080/api/jobs/job-2   # state=RUNNING
 ```
 
+验证落点选择（演示集群 node-a/node-b 为 8C16G2GPU，node-c 为 4C8G0GPU）：
+
+```bash
+# 小作业 2C2G：应落到最贴合的 node-c，而不是更大的 node-a/node-b
+curl -s -X POST localhost:8080/api/jobs -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"p1","user":"alice","priority":5,"nodeCount":1,
+       "cpu":2,"memoryMb":2048,"gpu":0}'
+# 用响应中的 jobId 查询：assignedNodeIds 应为 ["node-c"]
+curl -s localhost:8080/api/jobs/{jobId}
+# 需要 GPU 的大作业：node-c 无 GPU 装不下，落到 node-a/node-b 之一，立即启动
+curl -s -X POST localhost:8080/api/jobs -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"p2","user":"alice","priority":5,"nodeCount":1,
+       "cpu":6,"memoryMb":8192,"gpu":1}'
+curl -s localhost:8080/api/nodes        # 各节点占用不超过容量，账目可核对
+```
+
 ## 10. 测试与验证方法
 
 ```bash
 mvn test
 ```
 
-覆盖场景（共 27 个用例，全部断言 + 日志打印「输入」与「判定依据」）：
+覆盖场景（共 32 个用例，全部断言 + 日志打印「输入」与「判定依据」）：
 
 - `IdempotencyTest`：重复提交复用实例不重复占资源、同键内容冲突、非法请求、未知用户；
 - `ConcurrentSubmitTest`：32 线程并发同键提交只有 1 个 `ACCEPTED`；
   16 个不同作业并发提交到 8CPU 集群恰好运行 4 个、不超分；
 - `GangSchedulingTest`：多类资源跨节点同时满足才启动、不满足保持排队、
   `NO_FITTING_NODE` 与 `INSUFFICIENT_CAPACITY` 可区分、完成后回收再调度；
+- `BestFitPlacementTest`：不同容量节点下小作业落到最贴合节点、随后的大作业立即启动；
+  节点被部分占用后按真实剩余量选落点；放不下时 `INSUFFICIENT_CAPACITY`（带逐节点缺额）
+  与 `NO_FITTING_NODE` 可区分且释放后自动启动；成组总量超单机容量不被误判为不可行；
+  16 线程并发提交 + 提交/完成交错时每节点占用不超容量、账本与运行作业逐台对得上、
+  同批作业重复调度落点结论一致；
 - `NodeDrainTest`：排空中节点不接新作业且不驱逐既有作业、不可用节点被排除、恢复后排队作业启动；
 - `PreemptionQuotaTest`：严格优先级抢占与完整回收、同优先级不被抢占、抢占无意义时不误杀、
   三类配额超额原因；

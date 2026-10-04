@@ -29,20 +29,52 @@ dto/         请求/响应视图
   不入队、不占资源。
 - 用户未配置配额：`UNKNOWN_USER`（HTTP `404`）。
 
-## 3. 成组调度（Gang Scheduling）策略
+## 3. 成组调度（Gang Scheduling）与落点（best-fit）策略
 
 - 作业需要的所有节点必须**同时**各自满足「每节点资源需求」才能启动，否则保持 `QUEUED`。
 - 放置判定顺序：
   1. **配额**（见下节）；
-  2. 健康可调度节点中，单机**容量上限** `capacity` 必须能容纳每节点需求
-     （`NO_FITTING_NODE` 是硬上限，排空恢复/抢占都改变不了，故提前给出明确原因）；
-  3. 当前空闲资源能一次性凑齐 `nodeCount` 个节点 => 立即成组启动；
-  4. 否则给出 `INSUFFICIENT_CAPACITY`，响应/日志包含**逐节点缺额**（每类资源还差多少）。
-- 节点选择采用 best-fit：富余资源最贴近需求的节点优先，为更大需求保留充裕节点。
+  2. **单机容量硬上限**：对**全集群所有节点（含 DRAINING/UNAVAILABLE）**按 `capacity`
+     逐类判定，容量达标的节点总数都凑不齐 `nodeCount` 时才给 `NO_FITTING_NODE`
+     （单机形状问题，新增节点/抢占/排空恢复都改变不了，消息中逐节点列出容量缺额）；
+  3. 容量达标后，只有**健康且当前剩余量**就能放下的节点立即可用；容量达标但节点
+     暂时排空/不可用、或剩余量暂时被别的作业占用时，给**临时**原因
+     `INSUFFICIENT_CAPACITY`，消息中逐节点列出当前缺额或节点状态——节点恢复健康或
+     其上作业完成释放后，下一轮扫描即可放置，**不会**把“集群里明明有装得下的节点、
+     只是当前腾不出”的请求误判成永久不可行；
+  4. 当前空闲资源能一次性凑齐 `nodeCount` 个节点 => 立即成组启动。
+- **节点选择采用 best-fit（剩余资源刚好够用、最贴近需求者优先）**：
+  - 对每个“当前剩余量就放得下”的健康节点计算逐维绝对富余
+    `slack = available - need`，只在作业**请求到的维度**上按
+    CPU → 内存 → GPU 的固定顺序做字典序比较，富余向量最小者胜出，
+    富余向量完全相同再按 `nodeId` 兜底；
+  - 因此一个 4 核小作业会优先落到仅剩 4 核的小节点，而**不是**最空闲的 16 核大节点，
+    大节点被保留给随后更大的作业——不再出现“小作业挤占大节点、大作业反而排不进去”；
+  - 判定依据（候选节点排序、各节点真实剩余量与逐维富余、最终选中节点）会以
+    `placement ...` 日志和 `PlacementOutcome` 说明完整打印，同一次提交为什么落在
+    这台节点上可以直接复核；排序只依赖账本快照（全部在同一把锁内取得），
+    故并发提交、提交与完成交错时同一批作业重复调度结论一致，无随机落点。
+- 异构容量与部分占用：硬上限看 `capacity`、立即放置看 `available()`（真实剩余量），
+  两者分开判定；已经在节点上运行的作业占用实时反映在剩余量与逐节点缺额中。
 - 成组分配是**原子操作**：先校验全部节点，再统一落账；任一节点失败则整体回滚，
   不存在部分分配。资源释放同样按全部分配节点完整回收。
-- 触发时机：新提交、作业完成/取消、节点恢复、以及显式 `POST /api/scheduler/tick`；
-  一轮内按「优先级降序、同优先级先到先得」扫描排队队列。
+- 触发时机：新提交、作业完成/取消、**注册新节点扩容**、节点恢复、以及显式
+  `POST /api/scheduler/tick`；一轮内按「优先级降序、同优先级先到先得、再按 jobId」
+  扫描排队队列（全序，结论确定）。
+
+### 3.1 落点与抢占、排空恢复如何配合
+
+- **抢占**：普通放置失败且存在严格更低优先级运行作业时才进入抢占规划；规划只模拟
+  不落账，模拟可用量 = 真实剩余 + 计划抢占将释放的量；“抢占后就绪的节点”排序使用
+  **同一套 best-fit 富余向量规则（含 nodeId 兜底）**，因此抢占路径与普通路径的落点
+  口径一致、可解释；抢占受害者选择也以「解锁数 → 更低优先级 → 更早提交 → jobId」
+  形成全序，结论可复现。单机容量硬上限不满足时直接 `NO_FITTING_NODE`，绝不误杀。
+- **排空/不可用**：`DRAINING/UNAVAILABLE` 节点不参与立即放置与抢占放置，但其
+  `capacity` 仍参与硬上限判定——容量装得下、只是节点暂不可调度时是临时
+  `INSUFFICIENT_CAPACITY`；节点恢复 `HEALTHY` 后经下一轮扫描（完成/取消/扩容/tick
+  都会触发）按真实剩余量参与 best-fit，排队作业自动落到恢复节点。
+- **依赖解锁**：`WAITING` 作业前置全部成功后转为 `QUEUED`，走与普通作业完全相同的
+  配额 → best-fit 放置 → 抢占判定。
 
 ## 4. 节点健康与排空
 
@@ -159,19 +191,47 @@ curl -s -X POST localhost:8080/api/jobs/job-1/complete
 curl -s localhost:8080/api/jobs/job-2   # state=RUNNING
 ```
 
+验证 best-fit 落点（演示集群 node-a/node-b 各 8C、node-c 4C）：
+
+```bash
+mvn spring-boot:run
+# 4C 小作业：node-c(4C) 最贴合，应落在 node-c 而不是空闲的 8C 节点
+curl -s -X POST localhost:8080/api/jobs -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"bf-small","user":"alice","priority":5,"nodeCount":1,
+       "cpu":4,"memoryMb":1000,"gpu":0}'
+#   => assignedNodeIds=["node-c"]（日志: placement ... 候选按富余向量排序 选中=[node-c]）
+# 8C 大作业：宽裕节点被保留，应立即在 node-a 启动，不会排不上
+curl -s -X POST localhost:8080/api/jobs -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"bf-large","user":"alice","priority":5,"nodeCount":1,
+       "cpu":8,"memoryMb":1000,"gpu":0}'
+#   => state=RUNNING, assignedNodeIds=["node-a"]
+# 单机装不下：16C 超过任何单机容量 => QUEUED + reasonCode=NO_FITTING_NODE（永久形状问题）
+curl -s -X POST localhost:8080/api/jobs -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"bf-huge","user":"alice","priority":5,"nodeCount":1,
+       "cpu":16,"memoryMb":1000,"gpu":0}'
+#   => state=QUEUED, reasonCode=NO_FITTING_NODE，lastReason 逐节点列出容量缺额
+```
+
 ## 10. 测试与验证方法
 
 ```bash
 mvn test
 ```
 
-覆盖场景（共 27 个用例，全部断言 + 日志打印「输入」与「判定依据」）：
+覆盖场景（共 32 个用例，全部断言 + 日志打印「输入」与「判定依据」）：
 
 - `IdempotencyTest`：重复提交复用实例不重复占资源、同键内容冲突、非法请求、未知用户；
 - `ConcurrentSubmitTest`：32 线程并发同键提交只有 1 个 `ACCEPTED`；
   16 个不同作业并发提交到 8CPU 集群恰好运行 4 个、不超分；
 - `GangSchedulingTest`：多类资源跨节点同时满足才启动、不满足保持排队、
   `NO_FITTING_NODE` 与 `INSUFFICIENT_CAPACITY` 可区分、完成后回收再调度；
+- `PlacementSelectionTest`（落点专项）：异构 4C/8C/16C 集群上小作业贴合落到小节点、
+  随后 16C 大作业仍能立即启动；节点被部分占用后按真实剩余量贴合（n-mid 剩 2C 时
+  2C 作业落 n-mid 而非空节点）、多维度（GPU）贴合；容量达标节点全部排空时仅以临时
+  `INSUFFICIENT_CAPACITY` 排队、恢复后自动启动；单机 32C 硬上限与“总量够但单机放不下”
+  均给 `NO_FITTING_NODE` 且原因逐节点可解释、重复调度结论一致；16 作业并发提交连续 5 轮
+  落点直方图完全一致（1/2/4 打包）不超分，提交-完成交错时排队作业释放后自动落点且
+  账目与实际占用逐类对得上；
 - `NodeDrainTest`：排空中节点不接新作业且不驱逐既有作业、不可用节点被排除、恢复后排队作业启动；
 - `PreemptionQuotaTest`：严格优先级抢占与完整回收、同优先级不被抢占、抢占无意义时不误杀、
   三类配额超额原因；

@@ -52,7 +52,14 @@ public final class SchedulerService {
                 return false;
             }
             boolean ok = ledger.registerNode(nodeId, capacity);
-            log.info("register-node nodeId={} capacity={} result={}", nodeId, capacity, ok);
+            if (ok) {
+                // 注册扩容可能让此前因单机容量/节点数排队的作业变得可行，立即扫描一轮。
+                int started = runSchedulePass();
+                log.info("register-node nodeId={} capacity={} result={} 注册后扫描新启动={}",
+                        nodeId, capacity, ok, started);
+            } else {
+                log.info("register-node rejected: node already exists nodeId={}", nodeId);
+            }
             return ok;
         } finally {
             lock.unlock();
@@ -388,7 +395,8 @@ public final class SchedulerService {
         List<Job> queue = jobsById.values().stream()
                 .filter(j -> j.getState() == JobState.QUEUED)
                 .sorted(Comparator.comparingInt(Job::getPriority).reversed()
-                        .thenComparingLong(Job::getSubmittedAtMillis))
+                        .thenComparingLong(Job::getSubmittedAtMillis)
+                        .thenComparing(Job::getJobId))
                 .toList();
         int started = 0;
         for (Job job : queue) {
@@ -503,23 +511,29 @@ public final class SchedulerService {
             return quota;
         }
 
-        PlacementOutcome placement = findPlacement(job, ledger.schedulableNodes());
+        PlacementOutcome placement = findPlacement(job, ledger.allNodes());
         if (placement.success()) {
             commitPlacement(job, placement.selectedNodeIds(), List.of());
             return ReasonCode.NONE;
         }
 
         // 容量硬上限不满足时抢占也无意义。
-        if (placement.explanation() != null && placement.explanation().startsWith("NO_FITTING_NODE")) {
+        if (placement.reasonCode() == ReasonCode.NO_FITTING_NODE) {
             stayQueued(job, ReasonCode.NO_FITTING_NODE, placement.explanation());
             return ReasonCode.NO_FITTING_NODE;
         }
 
         PreemptivePlan plan = tryPlanPreemption(job);
         if (plan == null) {
-            ReasonCode code = hasLowerPriorityRunning(job)
+            boolean preemptable = hasLowerPriorityRunningOnFittingNode(job);
+            ReasonCode code = preemptable
                     ? ReasonCode.PREEMPTION_INSUFFICIENT : ReasonCode.INSUFFICIENT_CAPACITY;
-            stayQueued(job, code, explainInsufficient(job, placement, code));
+            // 没有可抢占对象时，排队依据直接采用放置判定的详细说明（逐节点缺额/状态）；
+            // 存在更低优先级受害者却仍放不下时，再补充“即使抢占仍不足”的前缀。
+            String basis = preemptable
+                    ? explainInsufficient(job, placement, code)
+                    : placement.explanation();
+            stayQueued(job, code, basis);
             return code;
         }
 
@@ -617,61 +631,154 @@ public final class SchedulerService {
     }
 
     /**
-     * 普通成组放置：必须一次性选出 nodeCount 个健康且各自满足 perNode 的节点。
-     * 选择策略：可用资源最贴近需求的节点优先（best-fit），为大需求保留充裕节点。
+     * 普通成组放置：必须一次性选出 nodeCount 个健康且当前剩余量各自满足 perNode 的节点。
+     *
+     * 判定分两层，排队原因严格区分：
+     * - 单机容量硬上限按「全集群所有节点」（含 DRAINING/UNAVAILABLE）判定：只有连
+     *   capacity 都装不下、或连容量达标节点总数都不够时，才是 NO_FITTING_NODE
+     *   （新增节点/抢占/排空恢复都改变不了单机形状）；
+     * - 容量达标但节点暂不可调度（排空/不可用）或剩余量暂时被占用 => 暂时放不下，
+     *   归 INSUFFICIENT_CAPACITY，节点恢复/作业完成释放后即可被再次调度，
+     *   不会把“总量够、单机形状够、只是当前腾不出”的请求误判成永久不可行。
+     *
+     * 选择策略：在所有“当前剩余量就能放下”的健康节点中按 best-fit 选最贴合的
+     * nodeCount 个，为后续更大的作业保留宽裕节点。
      */
-    private PlacementOutcome findPlacement(Job job, List<ClusterNode> candidates) {
+    private PlacementOutcome findPlacement(Job job, List<ClusterNode> allNodes) {
         ResourceSet need = job.getPerNodeResource();
 
-        // 硬上限：容量本身装不下的节点永远不可用（排空恢复/抢占都改变不了）。
-        List<ClusterNode> fitting = new ArrayList<>();
-        List<String> oversized = new ArrayList<>();
-        for (ClusterNode node : candidates) {
+        // 硬上限：对全集群所有节点按 capacity 判定，节点状态不影响容量形状。
+        List<ClusterNode> capacityFitting = new ArrayList<>();
+        List<String> overCapacity = new ArrayList<>();
+        for (ClusterNode node : allNodes) {
             if (ResourceSet.dominates(node.getCapacity(), need)) {
-                fitting.add(node);
+                capacityFitting.add(node);
             } else {
-                oversized.add(node.getNodeId());
+                overCapacity.add(node.getNodeId()
+                        + "(capacity=" + node.getCapacity() + ",state=" + node.getState() + ")");
             }
         }
-        if (fitting.size() < job.getNodeCount()) {
+        if (capacityFitting.size() < job.getNodeCount()) {
             String why = "NO_FITTING_NODE: 需要 " + job.getNodeCount()
-                    + " 个容量>= " + need + " 的健康节点，实际满足容量上限的只有 "
-                    + fitting.size() + " 个；不可参与: " + oversized;
-            return PlacementOutcome.fail(shortfallsByNode(fitting, need), why);
+                    + " 个单机容量逐类 >= " + need + " 的节点（全集群任意状态下判定），"
+                    + "容量达标节点只有 " + capacityFitting.size() + " 个；"
+                    + "容量本身装不下的节点: " + overCapacity;
+            return PlacementOutcome.fail(capacityShortfalls(allNodes, need),
+                    ReasonCode.NO_FITTING_NODE, why);
         }
 
-        List<ClusterNode> ready = fitting.stream()
+        // 临时层：容量达标后，只有健康且“当前剩余量”就够的节点立即可用。
+        List<ClusterNode> ready = capacityFitting.stream()
+                .filter(ClusterNode::isSchedulable)
                 .filter(n -> ResourceSet.dominates(n.available(), need))
                 .sorted(bestFitComparator(need))
                 .toList();
 
         if (ready.size() < job.getNodeCount()) {
+            java.util.Set<ClusterNode> readySet = new java.util.HashSet<>(ready);
+            List<String> notReady = new ArrayList<>();
+            for (ClusterNode node : capacityFitting) {
+                if (readySet.contains(node)) {
+                    continue;
+                }
+                if (!node.isSchedulable()) {
+                    notReady.add(node.getNodeId() + "(state=" + node.getState() + ",恢复后可参与)");
+                } else {
+                    notReady.add(node.getNodeId() + "(剩余=" + node.available()
+                            + ",缺额=" + ResourceLedger.shortfall(need, node.available()) + ")");
+                }
+            }
             String why = "INSUFFICIENT_CAPACITY: 需要 " + job.getNodeCount()
-                    + " 个节点同时各自腾出 " + need + "，当前立即可用 " + ready.size() + " 个";
-            return PlacementOutcome.fail(shortfallsByNode(fitting, need), why);
+                    + " 个健康节点同时各自腾出剩余量 " + need + "，当前立即可用 "
+                    + ready.size() + " 个；暂不可用的容量达标节点: " + notReady
+                    + "（节点恢复健康或其上作业完成释放后即可再调度）";
+            return PlacementOutcome.fail(shortfallsByNode(capacityFitting, need),
+                    ReasonCode.INSUFFICIENT_CAPACITY, why);
         }
 
         List<String> chosen = ready.subList(0, job.getNodeCount()).stream()
                 .map(ClusterNode::getNodeId).toList();
-        return PlacementOutcome.ok(chosen,
-                "found " + chosen.size() + " healthy nodes each satisfying " + need);
+        String basis = "best-fit 从 " + ready.size() + " 个可放下的健康节点中选择剩余资源最贴合需求的 "
+                + chosen.size() + " 个: " + chosen
+                + "（依据: 各候选逐维绝对富余 (剩余-需求) 按 CPU/内存/GPU 字典序比较，"
+                + "越小越贴合，富余向量相同按 nodeId 兜底）";
+        log.info("placement jobId={} need={} 候选(已按best-fit排序)={} 选中={}",
+                job.getJobId(), need, ready.stream()
+                        .map(n -> n.getNodeId() + "{剩余=" + n.available()
+                                + ",富余=" + slackDescription(n.available(), need) + "}")
+                        .toList(), chosen);
+        return PlacementOutcome.ok(chosen, basis);
     }
 
-    private Comparator<ClusterNode> bestFitComparator(ResourceSet need) {
-        return Comparator
-                .comparingLong((ClusterNode n) -> -slackScore(n.available(), need))
-                .thenComparing(ClusterNode::getNodeId);
-    }
-
-    /** 剩余量相对需求的总“富余分”，越小越贴合。 */
-    private long slackScore(ResourceSet available, ResourceSet need) {
-        long score = 0;
-        for (ResourceType type : ResourceType.values()) {
-            if (need.get(type) > 0) {
-                score += available.get(type) - need.get(type);
+    /** 对所有节点按“容量上限”统计逐类缺额（用于硬上限不可行的解释）。 */
+    private Map<String, Map<String, Long>> capacityShortfalls(List<ClusterNode> nodes, ResourceSet need) {
+        Map<String, Map<String, Long>> gaps = new LinkedHashMap<>();
+        for (ClusterNode node : nodes) {
+            Map<String, Long> gap = ResourceLedger.shortfall(need, node.getCapacity());
+            if (!gap.isEmpty()) {
+                gaps.put(node.getNodeId(), gap);
             }
         }
-        return score;
+        return gaps;
+    }
+
+    /**
+     * Best-fit 排序：剩余资源「最贴合需求」的节点优先——按各资源维度的
+     * 绝对富余 (available - need) 做字典序比较（CPU -> 内存 -> GPU），
+     * 富余向量完全相同再按 nodeId 兜底。绝对富余口径保证“剩余刚好够用”的
+     * 节点排在前面，把更宽裕的节点留给后面更大的作业；同时避免 CPU/内存/GPU
+     * 不同量纲直接相加。比较结果与调用批次无关，结论确定、可复现。
+     */
+    private Comparator<ClusterNode> bestFitComparator(ResourceSet need) {
+        return (a, b) -> compareSlackVector(slackVector(a.available(), need),
+                slackVector(b.available(), need), need, a.getNodeId(), b.getNodeId());
+    }
+
+    /**
+     * 按 ResourceType 固定顺序取各维度绝对富余（调用方保证 available 逐类 >= need）。
+     * 未请求的维度富余记 0，真正参与比较与否由 {@link #compareSlackVector} 决定。
+     */
+    private long[] slackVector(ResourceSet available, ResourceSet need) {
+        ResourceType[] types = ResourceType.values();
+        long[] vector = new long[types.length];
+        for (int i = 0; i < types.length; i++) {
+            vector[i] = available.get(types[i]) - need.get(types[i]);
+        }
+        return vector;
+    }
+
+    /**
+     * 富余向量字典序比较：仅在作业请求到的维度（need>0）上按 CPU/内存/GPU 顺序比较；
+     * 各维完全相同则按节点 id 兜底，保证选择稳定、可复现。
+     */
+    private int compareSlackVector(long[] va, long[] vb, ResourceSet need, String idA, String idB) {
+        ResourceType[] types = ResourceType.values();
+        for (int i = 0; i < types.length; i++) {
+            if (need.get(types[i]) <= 0) {
+                continue;
+            }
+            int cmp = Long.compare(va[i], vb[i]);
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+        return idA.compareTo(idB);
+    }
+
+    /** 可读的逐维富余描述，只列出作业请求到的资源维度（如 {CPU=2, GPU=0}）。 */
+    private String slackDescription(ResourceSet available, ResourceSet need) {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (ResourceType type : ResourceType.values()) {
+            if (need.get(type) > 0) {
+                if (!first) {
+                    sb.append(", ");
+                }
+                sb.append(type.name()).append('=').append(available.get(type) - need.get(type));
+                first = false;
+            }
+        }
+        return sb.append('}').toString();
     }
 
     private Map<String, Map<String, Long>> shortfallsByNode(List<ClusterNode> nodes, ResourceSet need) {
@@ -699,10 +806,26 @@ public final class SchedulerService {
 
     // ---------------- 抢占规划 ----------------
 
-    private boolean hasLowerPriorityRunning(Job requester) {
+    /**
+     * 是否存在运行在「健康且单机容量能容纳请求者需求」节点上的更低优先级作业。
+     * 排空中/不可用节点不参与抢占式放置，其上的低优先级作业不应让排队原因
+     * 被误报成 PREEMPTION_INSUFFICIENT。
+     */
+    private boolean hasLowerPriorityRunningOnFittingNode(Job requester) {
+        ResourceSet need = requester.getPerNodeResource();
+        java.util.Set<String> fittingHealthy = new java.util.HashSet<>();
+        for (ClusterNode node : ledger.schedulableNodes()) {
+            if (ResourceSet.dominates(node.getCapacity(), need)) {
+                fittingHealthy.add(node.getNodeId());
+            }
+        }
         for (Job j : jobsById.values()) {
             if (j.getState() == JobState.RUNNING && j.getPriority() < requester.getPriority()) {
-                return true;
+                for (String nodeId : j.getAssignedNodeIds()) {
+                    if (fittingHealthy.contains(nodeId)) {
+                        return true;
+                    }
+                }
             }
         }
         return false;
@@ -784,8 +907,10 @@ public final class SchedulerService {
                 ready.add(e.getKey());
             }
         }
-        ready.sort(Comparator.comparingLong((String id) -> -slackScore(simulatedAvailable.get(id), need))
-                .thenComparing(id -> id));
+        // 与普通放置一致的 best-fit：富余向量字典序最小者优先，同分按 nodeId 兜底。
+        ready.sort((idA, idB) -> compareSlackVector(
+                slackVector(simulatedAvailable.get(idA), need),
+                slackVector(simulatedAvailable.get(idB), need), need, idA, idB));
         return ready;
     }
 
@@ -816,6 +941,12 @@ public final class SchedulerService {
                 } else if (unlocks == bestUnlocks && best != null
                         && victim.getPriority() == best.getPriority()
                         && victim.getSubmittedAtMillis() < bestSubmittingAt) {
+                    better = true;
+                } else if (unlocks == bestUnlocks && best != null
+                        && victim.getPriority() == best.getPriority()
+                        && victim.getSubmittedAtMillis() == bestSubmittingAt
+                        && victim.getJobId().compareTo(bestId) < 0) {
+                    // 全序兜底：同解锁数/同优先级/同提交时刻时按 jobId，保证抢占规划结论稳定可复现。
                     better = true;
                 }
                 if (better) {
